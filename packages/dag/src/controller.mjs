@@ -15,6 +15,7 @@ import { normalizeRun, sessionRuns } from './model.mjs';
 import { t, languageOf } from './i18n.mjs';
 import { TaskData } from './task-data.mjs';
 import { RECOVERY_V1, sameScope, validScope, yieldIssues } from '../../coordination/src/recovery.mjs';
+import { ipcPath, queryPosixProcesses } from '../../coordination/src/platform.mjs';
 
 export function viewKey(socket, pane, session) {
   return createHash('sha256').update(JSON.stringify([socket, pane, session])).digest('hex').slice(0, 24);
@@ -720,10 +721,10 @@ export function herdrRead(query, { ttlMs = HERDR_READ_TTL_MS, now = Date.now } =
     return structuredClone(await entry.promise);
   };
 }
-const nativeShellProcesses = cachedProcessQuery(queryShellProcesses);
+const nativeShellProcesses = cachedProcessQuery(process.platform === 'win32' ? queryShellProcesses : queryPosixProcesses);
 export async function observePaneShell(info, record, inspect = nativeShellProcesses) {
   const pid = info?.process_info?.shell_pid;
-  if (process.platform !== 'win32' || !Number.isSafeInteger(pid) || pid < 1 ||
+  if (!Number.isSafeInteger(pid) || pid < 1 ||
     pid !== record.creationProcessId || info.process_info.pane_id && info.process_info.pane_id !== record.paneId) return null;
   let rows;
   try { rows = await inspect(pid); } catch { return null; }
@@ -740,16 +741,31 @@ export async function observePaneShell(info, record, inspect = nativeShellProces
     !Number.isFinite(Date.parse(child.CreationDate)) || Date.parse(child.CreationDate) < born)) return null;
   return { shell, children };
 }
+// POSIX Herdr lists the whole foreground process group, which includes the
+// viewer's own short-lived children (ps, herdr). Only the shell and its direct
+// foreground job are pane identity; their reported argv is exact, unlike a
+// space-joined command line.
+function paneForeground(info, observation) {
+  const foreground = info.process_info.foreground_processes ?? [];
+  if (process.platform === 'win32') return foreground;
+  const own = new Set([observation.shell.ProcessId, ...observation.children.map(child => child.ProcessId)]);
+  return foreground.filter(row => own.has(row.pid));
+}
+function childArgv(child, foreground) {
+  const reported = process.platform !== 'win32' && foreground.find(row => row.pid === child.ProcessId)?.argv;
+  return Array.isArray(reported) && reported.length && reported.join(' ') === child.CommandLine
+    ? [...reported] : parseLaunchCommand(child.CommandLine);
+}
 export async function legacyPaneIdentity(info, record, inspect) {
   if (!record.creationDate) return null;
   const observation = await observePaneShell(info, record, inspect);
   if (!observation || !observation.shell.Birth || record.creationBirth && observation.shell.Birth !== record.creationBirth ||
     observation.children.length > 1) return null;
-  const foreground = info.process_info.foreground_processes ?? [];
+  const foreground = paneForeground(info, observation);
   if (foreground.length !== 1 || ![record.creationProcessId, record.processId].includes(foreground[0].pid)) return null;
   const actual = { shell: nativeIdentity(observation.shell) };
   if (!observation.children.length) return record.prepared === true && !record.processId ? actual : null;
-  const child = observation.children[0], argv = parseLaunchCommand(child.CommandLine);
+  const child = observation.children[0], argv = childArgv(child, foreground);
   if (!child.Birth || record.viewerBirth && child.Birth !== record.viewerBirth ||
     pathKey(child.ExecutablePath) !== pathKey(record.nodePath) || !argv ||
     !processMatch({ process_info: { foreground_processes: [{ pid: child.ProcessId, argv }] } }, record)) return null;
@@ -882,7 +898,7 @@ export async function paneViewerProcess(info, record, expectedPid, inspect) {
   const foreground = processMatch(info, record, expectedPid);
   if (foreground) return foreground;
   const shell = info?.process_info?.shell_pid, pid = expectedPid ?? record.processId;
-  if (process.platform !== 'win32' || !Number.isSafeInteger(pid) || pid < 1 ||
+  if (!Number.isSafeInteger(pid) || pid < 1 ||
     !record.creationDate || !Number.isSafeInteger(record.creationProcessId) || shell !== record.creationProcessId ||
     info.process_info.foreground_processes?.length !== 1 ||
     info.process_info.foreground_processes[0].pid !== shell) return null;
@@ -897,14 +913,12 @@ export async function paneViewerProcess(info, record, expectedPid, inspect) {
 }
 export async function canCleanupPane(info, record, inspect) {
   if (info?.process_info?.shell_pid !== record.creationProcessId) return false;
-  if (process.platform !== 'win32') return (info.process_info.foreground_processes ?? [])
-    .every(row => row.pid === record.creationProcessId) || Boolean(processMatch(info, record));
   if (!record.creationDate) return false;
   const observation = await observePaneShell(info, record, inspect);
   if (!observation) return false;
   if (!observation.children.length) return true;
   if (observation.children.length !== 1) return false;
-  const child = observation.children[0], argv = parseLaunchCommand(child.CommandLine);
+  const child = observation.children[0], argv = childArgv(child, paneForeground(info, observation));
   return pathKey(child.ExecutablePath) === pathKey(record.nodePath) && argv !== null &&
     Boolean(processMatch({ process_info: { foreground_processes: [{ pid: child.ProcessId, argv }] } }, record));
 }
@@ -935,7 +949,7 @@ export class FixedDagPane extends DagPane {
     this.records = new Map();
     this.status = 'waiting';
     this.controlToken = randomBytes(32).toString('hex');
-    this.controlPath = `\\\\.\\pipe\\omo-herdr-dag-control-${randomUUID()}`;
+    this.controlPath = ipcPath(`omo-herdr-dag-control-${randomUUID()}`);
     this.controlSockets = new Set();
     this.controlJobs = new Set();
     this.pendingLaunches = new Set();

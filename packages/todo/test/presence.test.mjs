@@ -9,8 +9,9 @@ import { createSnapshotStorage } from '../src/storage.mjs';
 import { installDisplayBridge } from '../src/display-bridge.mjs';
 import { inlineRecoveryLines } from '../src/inline-recovery.mjs';
 import { projectNativeTodo } from '../src/native-todo.mjs';
+import { ipcPath } from '../../coordination/src/platform.mjs';
 
-const pipe = name => `\\\\.\\pipe\\omo-herdr-todo-task5-${name}`;
+const pipe = name => ipcPath(`omo-herdr-todo-task5-${name}`);
 console.log(`TASK5_TEST_PROCESS ${process.pid} ${process.version}`);
 const owner = { socketPath: 'test-herdr-socket', parentPaneId: 'test-parent', sessionId: 'test-session', scopeEpoch: 1 };
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };

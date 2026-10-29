@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import { FixedDagPane, paneViewerProcess, canCleanupPane, parseLaunchCommand } from '../src/controller.mjs';
 import { writeJson } from '../src/storage.mjs';
 import { payload, sessionId } from './fixtures.mjs';
+import { ipcPath } from '../../coordination/src/platform.mjs';
 
 function control(type, state, pid) {
   return new Promise((resolve, reject) => {
@@ -192,7 +193,7 @@ test('late offers serialize existing role writes without launching or emitting s
   const before = f.calls.filter(call => call[0] === 'run').length;
   const sourceEvents = [];
   const off = f.controller.provider().subscribeSource(source => sourceEvents.push(source));
-  const offers = Object.fromEntries(['dag', 'workers'].map(role => [role, { pipePath: '\\\\.\\pipe\\synthetic-presence',
+  const offers = Object.fromEntries(['dag', 'workers'].map(role => [role, { pipePath: ipcPath('synthetic-presence'),
     v: 1, token: 'presence-token', ownerKey: f.controller.key, sessionId, scopeEpoch: 2, role, sequence: 0 }]));
   await f.controller.setOffers(offers);
   off();

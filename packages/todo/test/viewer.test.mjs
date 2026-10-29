@@ -15,6 +15,7 @@ import { createSnapshotStorage } from '../src/storage.mjs';
 import { displayOwnerKey } from '../src/display-bridge.mjs';
 import { readRoleState } from '../src/controller.mjs';
 import { projectNativeTodo } from '../src/native-todo.mjs';
+import { ipcPath } from '../../coordination/src/platform.mjs';
 
 console.log(`TASK7_TEST_PROCESS ${process.pid} ${process.version}`);
 function signal(emitter, name, predicate = () => true) {
@@ -77,8 +78,8 @@ const native = content => projectNativeTodo([{ type: 'custom', customType: 'senp
 async function fixture(t, { offers = true, hold = false } = {}) {
   const id = randomUUID();
   const prefix = join(tmpdir(), `todo-viewer-${process.pid}-${id}-`);
-  const presencePipe = `\\\\.\\pipe\\todo-viewer-${process.pid}-${id}-presence`;
-  const controlPipe = `\\\\.\\pipe\\todo-viewer-${process.pid}-${id}-control`;
+  const presencePipe = ipcPath(`todo-viewer-${process.pid}-${id}-presence`);
+  const controlPipe = ipcPath(`todo-viewer-${process.pid}-${id}-control`);
   console.log(`TASK7_FIXTURE_DESCRIPTOR ${JSON.stringify({ pid: process.pid, prefix, presencePipe, controlPipe })}`);
   const directory = await fs.mkdtemp(prefix);
   console.log(`TASK7_FIXTURE_ALLOCATED ${JSON.stringify({ pid: process.pid, directory })}`);
@@ -657,7 +658,7 @@ test('same-scope source error, disconnect and reattach retain an active target w
   const owner = f.presence.getOwner();
   const replacement = createPresence({ ...owner,
     storage: createSnapshotStorage({ path: f.cachePath }),
-    pipePath: `\\\\.\\pipe\\todo-viewer-${process.pid}-${randomUUID()}-reattach` });
+    pipePath: ipcPath(`todo-viewer-${process.pid}-${randomUUID()}-reattach`) });
   t.after(() => replacement.close());
   await replacement.start();
   await replacement.publish({ ...projection(), ...replacement.getOwner() });

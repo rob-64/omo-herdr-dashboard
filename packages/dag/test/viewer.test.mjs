@@ -338,6 +338,7 @@ finally:
     child.wait(timeout=5)
   os.close(master)
 `;
+import { ipcPath } from '../../coordination/src/platform.mjs';
 
 async function preferenceWritten(file, predicate, action) {
   let resolve, reject;
@@ -791,7 +792,7 @@ test('fixed dag viewer ACKs a painted waiting presence snapshot (no native Todo)
   state.ownerKey = createHash('sha256').update(JSON.stringify([state.socketPath, state.parentPaneId, state.sessionId]))
     .digest('hex').slice(0, 24);
   const binding = { v: 1, token: randomUUID(), ownerKey: state.ownerKey, sessionId: state.sessionId, scopeEpoch: 1, role: 'dag' };
-  const pipePath = `\\\\.\\pipe\\dag-waiting-${process.pid}-${randomUUID()}`;
+  const pipePath = ipcPath(`dag-waiting-${process.pid}-${randomUUID()}`);
   state.presenceOffer = { pipePath, ...binding, sequence: 0 };
   // The presence end of the pipe: one waiting snapshot after the hello, then every ACK.
   const peer = new EventEmitter(), sockets = new Set();

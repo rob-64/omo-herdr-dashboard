@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { terminalInput, enablePointer, disablePointer, watchHerdrFocus } from './terminal-input.mjs';
 import { createHerdr } from './herdr.mjs';
 import { t } from './i18n.mjs';
+import { clearStaleIpc, ipcPath, isIpcPath } from '../../coordination/src/platform.mjs';
 import { completedTasks, defaultTaskId, renderFrame, runningTarget, workersSections } from './render.mjs';
 import { readJson } from './storage.mjs';
 import { TASK_SCOPE, emptyViewState, isExpanded, loadViewState, saveViewState, setExpanded } from './view-state.mjs';
@@ -38,7 +39,7 @@ function receive(socket, callback) {
 }
 function roleControl(type, state, paneId, launchToken) {
   const offer = state?.controlOffer;
-  if (!offer?.pipePath?.startsWith('\\\\.\\pipe\\') || paneId !== state.paneId ||
+  if (!isIpcPath(offer?.pipePath) || paneId !== state.paneId ||
     launchToken !== state.launchToken || !sameScope(offer, state)) return Promise.resolve(false);
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(offer.pipePath);
@@ -128,7 +129,7 @@ function bindPresence() {
   presenceClient?.destroy(); presenceClient = undefined; presenceMessage = undefined;
   if (!offer) { presenceNotice = 'Waiting for presence'; return; }
   if (offer.v !== 1 || offer.role !== role || !sameScope(offer, state) ||
-    !offer.pipePath?.startsWith('\\\\.\\pipe\\')) { presenceNotice = 'Invalid presence offer'; return; }
+    !isIpcPath(offer.pipePath)) { presenceNotice = 'Invalid presence offer'; return; }
   const client = net.createConnection(offer.pipePath);
   presenceClient = client;
   const binding = message => message?.v === 1 && message.token === offer.token &&
@@ -504,9 +505,11 @@ if (fixedView && launchToken) {
         launchToken, manual: false })}\n`, () => { void close(false); });
     });
   });
+  const retirementPath = ipcPath(`omo-herdr-viewer-retirement-${createHash('sha256').update(launchToken).digest('hex')}`);
+  await clearStaleIpc(retirementPath);
   await new Promise((resolve, reject) => {
     retirementServer.once('error', reject); retirementServer.once('listening', resolve);
-    retirementServer.listen(`\\\\.\\pipe\\omo-herdr-viewer-retirement-${createHash('sha256').update(launchToken).digest('hex')}`);
+    retirementServer.listen(retirementPath);
   });
 }
 bindPresence();

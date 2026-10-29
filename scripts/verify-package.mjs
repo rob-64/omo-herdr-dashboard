@@ -26,7 +26,7 @@ try {
       `await import(${JSON.stringify(pathToFileURL(join(installed, 'dist', component, 'src/viewer.mjs')).href)})`],
     { env, cwd: consumer, stdio: 'pipe' });
     const modules = component === 'todo' ?
-      ['child-guard', 'controller', 'display-bridge', 'inline-recovery', 'native-todo', 'parent-slot', 'presence', 'storage', 'viewer', 'terminal-input', 'render', 'i18n'].map(file => file + '.mjs') :
+      ['child-guard', 'controller', 'display-bridge', 'inline-recovery', 'native-observer', 'native-todo', 'parent-slot', 'presence', 'storage', 'viewer', 'terminal-input', 'render', 'i18n'].map(file => file + '.mjs') :
       (await readdir(join(root, 'packages', component, 'src'))).filter(file => file.endsWith('.mjs'));
     for (const file of ['extension.mjs', ...modules.map(file => 'src/' + file)]) {
       assert.equal(sha(await readFile(join(installed, 'dist', component, file))), sha(await readFile(join(root, 'dist', component, file))));

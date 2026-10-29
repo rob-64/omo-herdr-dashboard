@@ -3,6 +3,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { displayOwnerKey } from './display-bridge.mjs';
 import { sameSnapshotScope, validSnapshot } from './storage.mjs';
+import { clearStaleIpc, ipcPath, isIpcPath } from '../../coordination/src/platform.mjs';
 
 const roles = new Set(['todo', 'workers', 'dag']);
 const leaseMs = 10000;
@@ -31,11 +32,11 @@ function receive(socket, callback) {
 }
 
 export function createPresence({ socketPath, parentPaneId, sessionId, scopeEpoch = 1,
-  storage, pipePath = `\\\\.\\pipe\\omo-herdr-todo-${randomUUID()}`,
+  storage, pipePath = ipcPath(`omo-herdr-todo-${randomUUID()}`),
   clock = realClock, settings = {}, hasDagOwnedTasks = () => false }) {
   if (![socketPath, parentPaneId, sessionId].every(value => typeof value === 'string' && value.length > 0) ||
     !Number.isSafeInteger(scopeEpoch) || scopeEpoch < 1 ||
-    !pipePath.startsWith('\\\\.\\pipe\\')) throw new TypeError('Valid owner and Windows named pipe required');
+    !isIpcPath(pipePath)) throw new TypeError('Valid owner and local IPC path required');
   let owner = { socketPath, parentPaneId, sessionId, scopeEpoch,
     ownerKey: displayOwnerKey(socketPath, parentPaneId, sessionId) };
   const tokens = new Map([...roles].map(role => [role, randomBytes(32).toString('hex')]));
@@ -164,13 +165,13 @@ export function createPresence({ socketPath, parentPaneId, sessionId, scopeEpoch
     start() {
       if (closed) return Promise.reject(new Error('Presence closed'));
       if (starting) return starting;
-      starting = new Promise((resolve, reject) => {
+      starting = clearStaleIpc(pipePath).then(() => new Promise((resolve, reject) => {
         const failed = error => { server.off('listening', listening); reject(error); };
         const listening = () => { server.off('error', failed); started = true; emit('listening'); resolve(); };
         server.once('error', failed);
         server.once('listening', listening);
         server.listen(pipePath);
-      });
+      }));
       return starting;
     },
     publish(snapshot) {
@@ -282,7 +283,7 @@ export function createPresence({ socketPath, parentPaneId, sessionId, scopeEpoch
 // Protocol helper only. The viewer's render clock calls painted AFTER output
 // completion; receiving a snapshot, reading a file or constructing UI never ACKs.
 export function createRoleClient({ offer, onSnapshot, onStatus = () => {} }) {
-  if (!offer?.pipePath?.startsWith('\\\\.\\pipe\\') || !roles.has(offer.role)) throw new TypeError('Role pipe offer required');
+  if (!isIpcPath(offer?.pipePath) || !roles.has(offer.role)) throw new TypeError('Role pipe offer required');
   const events = new EventEmitter();
   const socket = net.createConnection(offer.pipePath);
   let current = null;

@@ -13,7 +13,8 @@ import { join } from 'node:path';
 for (const [role, subscribe] of [['dag', dagFocus], ['todo', todoFocus]]) {
   test(`${role} resumes only on native focus loss and closes its subscription`, async t => {
     const socketPath = process.platform === 'win32' ? `dashboard-focus-${randomUUID()}` :
-      join(tmpdir(), `dashboard-focus-${randomUUID()}.sock`);
+      // macOS caps Unix socket paths at 104 bytes; its per-user $TMPDIR is too long.
+      join(process.platform === 'darwin' ? '/tmp' : tmpdir(), `dfocus-${randomUUID().slice(0, 8)}.sock`);
     const path = process.platform === 'win32' ? `\\\\.\\pipe\\${socketPath}` : socketPath;
     let peer;
     const server = net.createServer(socket => {

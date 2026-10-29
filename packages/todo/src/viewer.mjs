@@ -11,6 +11,7 @@ import { captureLegacyProducer, createDashboardHerdr, createProducerCustodyServe
   createViewerRetirementServer, readRoleState, registerRoleViewer, requestRoleClose } from './controller.mjs';
 import { isClosedPhase, renderFrame, runningTarget, STRIKE_INTERVAL_MS, STRIKE_TOTAL_FRAMES } from './render.mjs';
 import { t } from './i18n.mjs';
+import { isIpcPath } from '../../coordination/src/platform.mjs';
 
 const pathKey = path => process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path);
 const samePath = (a, b) => typeof a === 'string' && typeof b === 'string' && pathKey(a) === pathKey(b);
@@ -43,7 +44,7 @@ export function validateRoleBinding(state, options) {
     !isAbsolute(state.cachePath ?? '')) throw new TypeError(t(state?.language, 'invalidBinding'));
   for (const offer of [state.presenceOffer, state.controlOffer]) {
     if (!offer) continue;
-    if (offer.v !== 1 || !offer.pipePath?.startsWith('\\\\.\\pipe\\') ||
+    if (offer.v !== 1 || !isIpcPath(offer.pipePath) ||
       typeof offer.token !== 'string' || !offer.token || offer.role !== 'todo' ||
       !sameSnapshotScope(offer, state)) throw new TypeError(t(state.language, 'invalidBinding'));
   }

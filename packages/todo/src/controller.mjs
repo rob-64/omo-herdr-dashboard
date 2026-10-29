@@ -5,6 +5,7 @@ import { EventEmitter, once } from 'node:events';
 import { mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { displayOwnerKey, installDisplayBridge } from './display-bridge.mjs';
@@ -14,6 +15,9 @@ import { claimParentSlot, cooperativelyReleasedParentSlot, parentSlotPaths, vali
 import { assertResult, bindingRevision, CORE_ORDER, createRecoveryCoordinator, deriveLowerBand, protocolError,
   queryIssues, RECOVERY_SCOPE_KEYS, RECOVERY_V1, sameScope, validScope } from '../../coordination/src/recovery.mjs';
 import { inspectViewerProof, readViewerProof, VIEWER_HEARTBEAT_LIMIT_MS } from '../../coordination/src/proof.mjs';
+import { clearStaleIpc, ipcPath, isIpcPath, processAlive, queryPosixProcesses, UNOBSERVABLE_EXIT_CODE,
+  waitForProcessExit } from '../../coordination/src/platform.mjs';
+import { connectIpc, ipcPeer, lineQueue, verifyProcess } from './native-observer.mjs';
 
 // The automatic or explicit Todo pass a managed mutation belongs to.
 const passes = new AsyncLocalStorage();
@@ -194,7 +198,7 @@ export async function readRoleState(path) {
 }
 function requestControl(type, { state, paneId, launchToken, pid = process.pid }) {
   const offer = state?.controlOffer;
-  if (!offer?.pipePath?.startsWith('\\\\.\\pipe\\') || state.paneId !== paneId ||
+  if (!isIpcPath(offer?.pipePath) || state.paneId !== paneId ||
     state.launchToken !== launchToken || offer.paneId !== paneId ||
     offer.launchToken !== launchToken || !sameSnapshotScope(offer, state) ||
     offer.role !== state.role) return Promise.resolve(false);
@@ -214,16 +218,40 @@ export const registerRoleViewer = options => requestControl('register', options)
 export const requestRoleClose = options => requestControl('close', options);
 
 export const viewerRetirementPipe = launchToken =>
-  `\\\\.\\pipe\\omo-herdr-viewer-retirement-${createHash('sha256').update(launchToken).digest('hex')}`;
+  ipcPath(`omo-herdr-viewer-retirement-${createHash('sha256').update(launchToken).digest('hex')}`);
+
+// POSIX form of the PowerShell retirement below: the same peer, birth, argv0,
+// argv digest and parent checks, then a wait for the exact process to vanish.
+async function retirePosixViewer(record, identity, request, nonce) {
+  const expected = identity.viewer, path = viewerRetirementPipe(record.launchToken);
+  const socket = await connectIpc(path);
+  try {
+    const replies = lineQueue(socket);
+    if (await ipcPeer(path) !== expected.pid) throw blocked('retirement peer changed');
+    const row = await verifyProcess(expected, 'retirement birth, argv or image changed');
+    if (row.ParentProcessId !== identity.shell.pid) throw blocked('retirement argv or parent changed');
+    socket.write(`${JSON.stringify(request)}\n`);
+    const raw = await replies.next(10000).catch(() => null);
+    if (!raw) throw blocked('retirement acknowledgement unavailable');
+    const reply = JSON.parse(raw);
+    if (reply.type !== 'retiring' || reply.nonce !== nonce || reply.launchToken !== record.launchToken)
+      throw blocked('retirement acknowledgement changed');
+    await waitForProcessExit(expected, 15000).catch(() => { throw blocked('original viewer exit unavailable'); });
+    const receipt = { pid: expected.pid, birth: expected.birth, exitCode: UNOBSERVABLE_EXIT_CODE,
+      manual: Boolean(reply.manual), nonce: reply.nonce, custodyClosure: reply.custodyClosure };
+    return { ...receipt, stdout: `${JSON.stringify(receipt)}\n`, stderr: '' };
+  } finally { socket.destroy(); }
+}
 
 export async function retireVerifiedViewer(record, identity) {
-  if (process.platform !== 'win32' || !identity?.viewer ||
+  if (!identity?.viewer ||
     identity.viewer.pid !== record.processId || identity.viewer.birth !== record.viewerBirth)
     throw blocked('viewer retirement requires exact original native identity');
   const expected = identity.viewer, nonce = randomUUID();
   const request = { type: 'retire', nonce, role: record.role, sessionId: record.sessionId,
     ownerKey: record.ownerKey, scopeEpoch: record.scopeEpoch, paneId: record.paneId,
     statePath: record.statePath, launchToken: record.launchToken };
+  if (process.platform !== 'win32') return retirePosixViewer(record, identity, request, nonce);
   const literal = value => "'" + String(value).replaceAll("'", "''") + "'";
   const script = `$ErrorActionPreference='Stop'
 Add-Type -TypeDefinition 'using System;using System.Text;using System.Runtime.InteropServices;public static class RetirePeer {
@@ -284,6 +312,7 @@ export async function createViewerRetirementServer(options, getState, retire, be
       })().catch(() => socket.destroy());
     });
   });
+  await clearStaleIpc(viewerRetirementPipe(options.launchToken));
   await new Promise((resolve, reject) => {
     server.once('error', reject); server.once('listening', resolve);
     server.listen(viewerRetirementPipe(options.launchToken));
@@ -405,7 +434,7 @@ export function cachedProcessQuery(query, { ttlMs = SHELL_QUERY_TTL_MS, now = Da
     return structuredClone(await entry.promise);
   };
 }
-const nativeShellProcesses = cachedProcessQuery(queryShellProcesses);
+const nativeShellProcesses = cachedProcessQuery(process.platform === 'win32' ? queryShellProcesses : queryPosixProcesses);
 // Herdr list/process-info reads are repeated by layout passes a few times per
 // second, and every uncached call synchronously spawns herdr on Windows. The
 // 1000 ms cache is cleared by the shared process epoch (any pane mutation, a
@@ -450,6 +479,19 @@ const nativeIdentity = row => {
     argvDigest: createHash('sha256').update(row.CommandLine).digest('hex') };
 };
 const retirementCaptures = new WeakMap();
+// POSIX observers run as a Node child (OmO itself may be a Bun binary). The
+// child is detached so it never joins a pane's foreground process group.
+const nativeObserverPath = fileURLToPath(new URL('./native-observer.mjs', import.meta.url));
+let observerNode;
+async function spawnNativeObserver(config) {
+  observerNode ??= !process.versions.bun && /^node(?:js)?$/i.test(basename(process.execPath))
+    ? Promise.resolve(process.execPath) : resolveDashboardNode();
+  const node = await observerNode.catch(error => { observerNode = undefined; throw error; });
+  const child = spawn(node, [nativeObserverPath], { detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  child.stdin.on('error', () => {});
+  child.stdin.write(`${JSON.stringify(config)}\n`);
+  return child;
+}
 export async function captureLegacyProducer({ stateDir, recordPath, parent, herdr, slotPath, slotStateDir = stateDir,
   custody = false }) {
   const root = pathKey(await realpath(resolve(stateDir))), path = await realpath(recordPath);
@@ -461,7 +503,7 @@ export async function captureLegacyProducer({ stateDir, recordPath, parent, herd
   if (record.parentPaneId !== parent.paneId || record.tabId !== parent.tabId ||
     !sameDashboardOwner(record, state) || record.role !== state.role || record.paneId !== state.paneId ||
     record.launchToken !== state.launchToken || !sameControl(offer, { ...offer, ...state, statePath: record.statePath }) ||
-    !offer?.pipePath?.startsWith('\\\\.\\pipe\\')) throw blocked('legacy control binding unavailable');
+    !isIpcPath(offer?.pipePath)) throw blocked('legacy control binding unavailable');
   const members = (await herdr('list')).panes, parents = members?.filter(pane => pane.pane_id === parent.paneId);
   if (parents?.length !== 1 || parents[0].tab_id !== parent.tabId) throw blocked('legacy parent membership changed');
   const info = await herdr('process-info', '--pane', parent.paneId);
@@ -578,8 +620,9 @@ do {$line=$reader.ReadLineAsync();if(!$line.Wait(15000)){throw 'producer release
 }elseif($mode -eq 'dispose' -or $null -eq $mode){break}else{throw 'invalid observer action'}
 }
 }finally{if($inputReader){$inputReader.Dispose()};if($processWait){$processWait.Dispose()};if($idle){$idle.Dispose()};if($p){$p.Dispose()};$pipe.Dispose()}`;
-  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand',
-    Buffer.from(script, 'utf16le').toString('base64')], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = process.platform === 'win32' ? spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand',
+    Buffer.from(script, 'utf16le').toString('base64')], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+    : await spawnNativeObserver({ mode: 'capture', pipePath: offer.pipePath, request, nonce, token: offer.token, custody });
   const events = new EventEmitter();
   let stdout = '', stderr = '', buffer = '', alive = true, captured, invalidated = false, disposing;
   const terminal = new Promise((resolve, reject) => {
@@ -729,7 +772,7 @@ export async function observeLegacyRetirement(observation, { stateDir, recordPat
     exitCode: captured.death.exitCode };
 }
 const custodyPipe = launchToken =>
-  `\\\\.\\pipe\\omo-herdr-producer-custody-${createHash('sha256').update(launchToken).digest('hex')}`;
+  ipcPath(`omo-herdr-producer-custody-${createHash('sha256').update(launchToken).digest('hex')}`);
 
 export async function createProducerCustodyServer(options, getObservation) {
   const sockets = new Set();
@@ -777,6 +820,7 @@ export async function createProducerCustodyServer(options, getObservation) {
       })().catch(() => socket.destroy());
     });
   });
+  await clearStaleIpc(custodyPipe(options.launchToken));
   await new Promise((resolve, reject) => {
     server.once('error', reject); server.once('listening', resolve);
     server.listen(custodyPipe(options.launchToken));
@@ -864,8 +908,10 @@ if($proof.type -cne 'custody-valid' -or $proof.nonce -cne ${literal(nonce)} -or 
 }elseif($mode -eq 'dispose' -or $null -eq $mode){break}else{throw 'invalid custody observer action'}
 }
 }finally{if($duplicate -ne [IntPtr]::Zero){$null=[CustodyPeer]::CloseHandle($duplicate)};if($holder){$holder.Dispose()};if($v){$v.Dispose()};$pipe.Dispose()}`;
-  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand',
-    Buffer.from(script, 'utf16le').toString('base64')], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = process.platform === 'win32' ? spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand',
+    Buffer.from(script, 'utf16le').toString('base64')], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+    : await spawnNativeObserver({ mode: 'custodied', pipePath: custodyPipe(record.launchToken), viewer,
+      shellPid: roleIdentity.shell.pid, request, nonce, launchToken: record.launchToken, producer });
   const events = new EventEmitter();
   let stdout = '', stderr = '', buffer = '', alive = true;
   const terminal = new Promise((resolve, reject) => {
@@ -923,7 +969,28 @@ if($proof.type -cne 'custody-valid' -or $proof.nonce -cne ${literal(nonce)} -or 
     return observation;
   } catch (error) { await observation.dispose(); throw error; }
 }
+// POSIX form of the observer below. Without a process handle the exact
+// (pid, birth) instance is armed by a live check and polled until it vanishes.
+async function observePosixExit(identity, held) {
+  if (!await processAlive(identity)) throw blocked('native exit observer: birth changed');
+  let requested, choose;
+  const chosen = held ? new Promise(resolve => { choose = resolve; }) : Promise.resolve('death');
+  const receipt = (stdout, exitCode) => ({ exitCode, disposed: exitCode === null, stdout, stderr: '', code: 0,
+    pid: process.pid, stdoutEOF: true, stderrEOF: true });
+  const effects = chosen.then(async mode => {
+    if (mode === 'dispose') return receipt('ARMED\nDISPOSED\n', null);
+    await waitForProcessExit(identity, 15000).catch(() => { throw blocked('native exit observer 1: native effect deadline'); });
+    return receipt(`ARMED\n${UNOBSERVABLE_EXIT_CODE}\n`, UNOBSERVABLE_EXIT_CODE);
+  });
+  effects.catch(() => {});
+  return { effects,
+    ...(held ? {
+      death() { if (!requested) { requested = 'death'; choose('death'); } return effects; },
+      dispose() { if (!requested) { requested = 'dispose'; choose('dispose'); } return effects; },
+    } : {}) };
+}
 async function observeNativeExit(identity, held = false) {
+  if (process.platform !== 'win32') return observePosixExit(identity, held);
   const script = `$ErrorActionPreference='Stop';$p=[Diagnostics.Process]::GetProcessById(${identity.pid});try{
     $null=$p.Handle;if($p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -cne '${identity.birth.replaceAll("'", "''")}'){throw 'birth changed'}
     [Console]::WriteLine('ARMED')
@@ -961,7 +1028,7 @@ async function observeNativeExit(identity, held = false) {
 }
 export async function observePaneShell(info, record, inspect = nativeShellProcesses) {
   const pid = info?.process_info?.shell_pid;
-  if (process.platform !== 'win32' || !Number.isSafeInteger(pid) || pid < 1 ||
+  if (!Number.isSafeInteger(pid) || pid < 1 ||
     pid !== record.creationProcessId || info.process_info.pane_id && info.process_info.pane_id !== record.paneId) return null;
   let rows;
   try { rows = await inspect(pid); } catch { return null; }
@@ -978,16 +1045,31 @@ export async function observePaneShell(info, record, inspect = nativeShellProces
     !Number.isFinite(Date.parse(child.CreationDate)) || Date.parse(child.CreationDate) < born)) return null;
   return { shell, children };
 }
+// POSIX Herdr lists the whole foreground process group, which includes the
+// viewer's own short-lived children (ps, herdr). Only the shell and its direct
+// foreground job are pane identity; their reported argv is exact, unlike a
+// space-joined command line.
+function paneForeground(info, observation) {
+  const foreground = info.process_info.foreground_processes ?? [];
+  if (process.platform === 'win32') return foreground;
+  const own = new Set([observation.shell.ProcessId, ...observation.children.map(child => child.ProcessId)]);
+  return foreground.filter(row => own.has(row.pid));
+}
+function childArgv(child, foreground) {
+  const reported = process.platform !== 'win32' && foreground.find(row => row.pid === child.ProcessId)?.argv;
+  return Array.isArray(reported) && reported.length && reported.join(' ') === child.CommandLine
+    ? [...reported] : parseLaunchCommand(child.CommandLine);
+}
 export async function legacyPaneIdentity(info, record, inspect) {
   if (!record.creationDate) return null;
   const observation = await observePaneShell(info, record, inspect);
   if (!observation || !observation.shell.Birth || record.creationBirth && observation.shell.Birth !== record.creationBirth ||
     observation.children.length > 1) return null;
-  const foreground = info.process_info.foreground_processes ?? [];
+  const foreground = paneForeground(info, observation);
   if (foreground.length !== 1 || ![record.creationProcessId, record.processId].includes(foreground[0].pid)) return null;
   const actual = { shell: nativeIdentity(observation.shell) };
   if (!observation.children.length) return record.prepared === true && !record.processId ? actual : null;
-  const child = observation.children[0], argv = parseLaunchCommand(child.CommandLine);
+  const child = observation.children[0], argv = childArgv(child, foreground);
   const expected = [record.nodePath, record.viewerPath,
     ...(record.role && record.role !== 'todo' ? ['--view', record.role === 'dag' ? 'dag' : 'tasks'] : []),
     '--state', record.statePath, '--close-pane', record.paneId, '--launch-token', record.launchToken];
@@ -1002,9 +1084,10 @@ export async function paneViewerProcess(info, record, expectedPid, inspect) {
   const foreground = viewerProcess(info, record, expectedPid);
   if (foreground) return foreground;
   const shell = info?.process_info?.shell_pid, pid = expectedPid ?? record.processId;
-  // Windows Herdr reports the PowerShell shell, not its foreground Node child.
-  // Only the shell returned for this exact split can anchor a native PID query.
-  if (process.platform !== 'win32' || !Number.isSafeInteger(pid) || pid < 1 ||
+  // Windows Herdr reports the PowerShell shell, not its foreground Node child
+  // (POSIX Herdr can lag the same way). Only the shell returned for this exact
+  // split can anchor a native PID query.
+  if (!Number.isSafeInteger(pid) || pid < 1 ||
     !record.creationDate || !Number.isSafeInteger(record.creationProcessId) || shell !== record.creationProcessId ||
     info.process_info.foreground_processes?.length !== 1 ||
     info.process_info.foreground_processes[0].pid !== shell) return null;
@@ -1019,14 +1102,12 @@ export async function paneViewerProcess(info, record, expectedPid, inspect) {
 }
 export async function canCleanupPane(info, record, inspect) {
   if (info?.process_info?.shell_pid !== record.creationProcessId) return false;
-  if (process.platform !== 'win32') return (info.process_info.foreground_processes ?? [])
-    .every(row => row.pid === record.creationProcessId) || Boolean(viewerProcess(info, record));
   if (!record.creationDate) return false;
   const observation = await observePaneShell(info, record, inspect);
   if (!observation) return false;
   if (!observation.children.length) return true;
   if (observation.children.length !== 1) return false;
-  const child = observation.children[0], argv = parseLaunchCommand(child.CommandLine);
+  const child = observation.children[0], argv = childArgv(child, paneForeground(info, observation));
   return pathKey(child.ExecutablePath) === pathKey(record.nodePath) && argv !== null &&
     Boolean(viewerProcess({ process_info: { foreground_processes: [{ pid: child.ProcessId, argv }] } }, record));
 }
@@ -1055,8 +1136,8 @@ export class TodoPane {
     this.ownedRoles = new Map();
     this.unsubscribers = [];
     this.controlToken = randomBytes(32).toString('hex');
-    this.controlPath = `\\\\.\\pipe\\omo-herdr-todo-control-${randomUUID()}`;
-    this.presencePath = `\\\\.\\pipe\\omo-herdr-todo-${randomUUID()}`;
+    this.controlPath = ipcPath(`omo-herdr-todo-control-${randomUUID()}`);
+    this.presencePath = ipcPath(`omo-herdr-todo-${randomUUID()}`);
     this.controlSockets = new Set();
     this.status = 'waiting';
     this.managedTail = Promise.resolve();
